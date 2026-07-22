@@ -2,6 +2,10 @@ name: Link Checker
 
 on: [push, pull_request]
 
+permissions:
+  contents: read
+  checks: write # required to post the neutral "Link Redirects" check-run
+
 jobs:
   linkchecker:
 
@@ -44,7 +48,7 @@ jobs:
 
       # Turn each redirect the pass above found into a PR annotation, so a moved
       # link shows up inline on the PR (Files changed + checks summary) instead
-      # of only in the run's job summary. Never fails the build.
+      # of only in the run's job summary. Works on fork PRs too. Never fails.
       - name: Annotate redirecting links
         if: always()
         run: |
@@ -62,5 +66,56 @@ jobs:
               printf "::warning file=%s,line=%s,col=%s,title=Redirecting link::%s redirects (%s) -- update to its final destination\n", file, line, col, url, code
             }
           ' "$report"
+
+      # Publish a distinct "Link Redirects" check-run with a neutral conclusion
+      # when permanent redirects are found, so a moved link shows up as its own
+      # yellow (neutral) badge in the PR checks list -- not just an annotation
+      # on the linkchecker job. Neutral never blocks merge.
+      #
+      # Creating a check-run needs a checks:write token. Fork PRs get a
+      # read-only GITHUB_TOKEN, so the API call 403s there; the step swallows
+      # that (|| true) and the annotation step above remains the fork-PR signal.
+      - name: Publish redirect check-run (neutral)
+        if: always()
         env:
-          GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          # PR events: annotate the PR head, not the synthetic merge commit.
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          report="lychee/redirects.md"
+          # Build a markdown list of the redirecting links from the report.
+          links="$(awk '
+            /^### Errors in / { file=$0; sub(/^### Errors in /, "", file); next }
+            /^\* \[30[0-9]\]/ {
+              url=$0; sub(/^[^<]*</, "", url); sub(/>.*/, "", url)
+              code=$0; sub(/^\* \[/, "", code); sub(/\].*/, "", code)
+              printf "- `%s:%s` [%s] %s\n", file, "", code, url
+            }
+          ' "$report" 2>/dev/null || true)"
+
+          if [ -z "$links" ]; then
+            conclusion="success"
+            title="No redirecting links"
+            summary="All checked links resolve directly (no permanent redirects)."
+          else
+            conclusion="neutral"
+            count="$(printf '%s\n' "$links" | grep -c '^- ')"
+            title="$count redirecting link(s) should be updated"
+            summary=$(printf 'These links return a permanent redirect (301/308). Update them to their final destination.\n\n%s' "$links")
+          fi
+
+          # Post the check-run. checks:write is unavailable on fork PRs, where
+          # this 403s; do not fail the job over it.
+          gh api "repos/$REPO/check-runs" \
+            -f name='Link Redirects' \
+            -f head_sha="$HEAD_SHA" \
+            -f status='completed' \
+            -f conclusion="$conclusion" \
+            -f "output[title]=$title" \
+            -f "output[summary]=$summary" \
+            -f "details_url=$RUN_URL" \
+            >/dev/null \
+            && echo "posted 'Link Redirects' check-run: $conclusion" \
+            || echo "could not post check-run (expected on fork PRs with a read-only token); the annotation step already surfaced redirects"
